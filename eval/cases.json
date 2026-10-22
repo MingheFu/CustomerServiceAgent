@@ -1,0 +1,135 @@
+{
+  "version": "1.0",
+  "description": "端到端 Agent 评测集。依赖 Java 后端 seed 数据（V2__seed_data.sql）与 .env 中的 LLM 配置。",
+  "cases": [
+    {
+      "id": "order_lookup_valid",
+      "tags": ["order", "happy_path"],
+      "description": "合法订单号直接查询",
+      "user_input": "帮我查一下订单 2024-78901",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["lookup_order"],
+      "must_contain_any": ["2024-78901", "Keychron", "键盘", "已发货", "顺丰"],
+      "must_not_contain": ["订单不存在", "未找到您的订单"]
+    },
+    {
+      "id": "order_self_correct_id",
+      "tags": ["order", "self_correction"],
+      "description": "缺年份订单号，应规范化为 2024-78901 并查到正确订单",
+      "user_input": "帮我查下订单 78901",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["lookup_order"],
+      "must_contain_any": ["2024-78901", "Keychron", "键盘"],
+      "notes": "允许模型直接补全年份一次成功，也允许先触发工具校验失败后自修正；核心是最终回复须基于正确订单。"
+    },
+    {
+      "id": "order_search_by_product",
+      "tags": ["order", "happy_path"],
+      "description": "不记得订单号，用商品关键词搜索",
+      "user_input": "我买了一把机械键盘，忘了订单号，能帮我找找吗？",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["search_orders"],
+      "must_contain_any": ["2024-78901", "键盘", "Keychron"],
+      "acceptable_routes": ["ORDER_QUERY"]
+    },
+    {
+      "id": "order_modify_address_pending",
+      "tags": ["order", "happy_path"],
+      "description": "未发货订单修改地址（2024-78902 为 PENDING_SHIPMENT）",
+      "user_input": "请把订单 2024-78902 的收货地址改成：上海市浦东新区张江路 100 号 8 楼",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["modify_order_address"],
+      "must_contain_any": ["2024-78902", "地址", "更新", "成功"],
+      "must_not_contain": ["已发货", "无法修改"]
+    },
+    {
+      "id": "order_modify_blocked_shipped",
+      "tags": ["order", "business_blocked"],
+      "description": "已发货订单改地址应被业务规则拒绝",
+      "user_input": "把订单 2024-78901 的收货地址改成北京市海淀区中关村大街 1 号",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["modify_order_address"],
+      "must_contain_any": ["已发货", "无法", "不能", "修改"],
+      "notes": "工具返回 BUSINESS_BLOCKED 后，Agent 应向用户解释原因。"
+    },
+    {
+      "id": "order_not_found",
+      "tags": ["order", "not_found"],
+      "description": "订单号格式合法但数据库不存在",
+      "user_input": "查询订单 2024-99999 的状态",
+      "expected_route": "ORDER_QUERY",
+      "expected_tools": ["lookup_order"],
+      "must_contain_any": ["99999", "未找到", "不存在", "没有", "查不到"],
+      "must_not_contain": ["Keychron", "已发货", "顺丰速运 SF1234567890"]
+    },
+    {
+      "id": "refund_policy_keyboard",
+      "tags": ["refund", "happy_path"],
+      "description": "查询键盘类退换货政策",
+      "user_input": "买的机械键盘不满意，能退吗？退换货政策是什么？",
+      "expected_route": "REFUND_RETURN",
+      "expected_tools": ["check_return_policy"],
+      "must_contain_any": ["键盘", "7", "天", "未拆封"],
+      "must_not_contain": ["随时退款", "无条件终身"]
+    },
+    {
+      "id": "refund_create_request",
+      "tags": ["refund", "happy_path"],
+      "description": "为已发货订单创建退货申请",
+      "user_input": "订单 2024-78901 的键盘有质量问题，帮我提交退货申请，原因写质量问题",
+      "expected_route": "REFUND_RETURN",
+      "expected_tools": ["create_return_request"],
+      "must_contain_any": ["2024-78901", "退货", "申请", "工单", "提交"],
+      "acceptable_tools_extra": ["lookup_order", "check_return_policy"]
+    },
+    {
+      "id": "product_search_specs",
+      "tags": ["product", "happy_path"],
+      "description": "按品牌关键词查商品规格",
+      "user_input": "Keychron K8 Pro 键盘的参数规格有哪些？",
+      "expected_route": "PRODUCT_KNOWLEDGE",
+      "expected_tools": ["search_product_specs"],
+      "must_contain_any": ["Keychron", "键盘", "蓝牙", "轴"],
+      "must_not_contain": ["我们没有这款", "不存在该产品"]
+    },
+    {
+      "id": "product_recommend_office",
+      "tags": ["product", "happy_path"],
+      "description": "按场景和预算推荐商品",
+      "user_input": "我主要用来办公，预算 500 到 1000，推荐一款鼠标或键盘",
+      "expected_route": "PRODUCT_KNOWLEDGE",
+      "expected_tools": ["get_product_recommendation"],
+      "must_contain_any": ["推荐", "鼠标", "键盘", "办公"],
+      "acceptable_tools_extra": ["search_product_specs"]
+    },
+    {
+      "id": "chitchat_greeting",
+      "tags": ["chitchat"],
+      "description": "寒暄不应触发业务工具",
+      "user_input": "你好，在吗？",
+      "expected_route": "CHITCHAT",
+      "forbidden_tools": [
+        "lookup_order",
+        "search_orders",
+        "modify_order_address",
+        "check_return_policy",
+        "create_return_request",
+        "search_product_specs",
+        "get_product_recommendation"
+      ],
+      "must_contain_any": ["你好", "您好", "在", "帮", "客服"],
+      "notes": "路由偶有波动；forbidden_tools 是硬约束。"
+    },
+    {
+      "id": "hitl_explicit_request",
+      "tags": ["hitl"],
+      "description": "用户明确要求转人工",
+      "user_input": "这个问题太复杂了，帮我转人工客服处理",
+      "expected_route": "CHITCHAT",
+      "acceptable_routes": ["CHITCHAT", "ORDER_QUERY", "REFUND_RETURN", "PRODUCT_KNOWLEDGE"],
+      "require_escalation": true,
+      "must_contain_any": ["人工", "工单", "客服"],
+      "notes": "可能先路由到闲聊再 escalate；核心是工单创建成功。"
+    }
+  ]
+}
