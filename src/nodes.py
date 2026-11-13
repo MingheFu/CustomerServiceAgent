@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # 常量
 # ---------------------------------------------------------------------------
 
-MAX_CORRECTION_ATTEMPTS = 3  # 每轮最多允许 3 次工具调用迭代
+MAX_CORRECTION_ATTEMPTS = 3  # 业务 LLM 调用轮数上限（包含正常调用，并非仅失败重试）
 
 # DeepSeek 默认启用 thinking mode，要求 reasoning_content 必须回传。
 # LangChain 的 AIMessage 无法自动保留该字段，因此全局禁用 thinking。
@@ -321,29 +321,21 @@ def _build_domain_subgraph(
     """
     通用的业务域子图工厂。
 
-    拓扑结构:
-        START → llm_node → [conditional]
-                    │            ├── 有 tool_calls 且未超限 → tool_node → llm_node (循环)
-                    │            └── 无 tool_calls 或超限 → END
-                    │
-                  tool_node (ToolNode 自动执行工具)
-
-    自我修正机制:
-        每次 LLM 调用都会递增 correction_attempts。
-        达到 MAX_CORRECTION_ATTEMPTS 后强制终止循环，
-        防止无限重试。
+    最多执行 MAX_CORRECTION_ATTEMPTS 轮业务 LLM，再执行一次兜底 LLM。
+    普通工具返回后继续推理；转人工或兜底模型发出的工具请求进入
+    finish 节点，至多创建一次工单、补齐工具结果并直接结束。
     """ 
     builder = StateGraph(AgentState)
 
     # 闭包：将 system_prompt 注入 LLM 调用。
-    # 超限时自动切换为不带 tool 的 chat_llm，保证最终一定输出文本回复。
+    # 达到业务推理轮数上限后，只允许一次兜底模型调用。
     def _llm_node(state: AgentState) -> dict:
         attempts = state.get("correction_attempts", 0)
         if attempts >= MAX_CORRECTION_ATTEMPTS:
             # HITL 兜底：只允许 escalate_to_human 一种 tool，防止继续调用业务工具
             override_prompt = (
                 system_prompt
-                + "\n\n【HITL 兜底】工具调用已达上限。你有两个选择：\n"
+                + "\n\n【HITL 兜底】业务推理轮数已达上限。你有两个选择：\n"
                 "1. 如果已有足够信息 → 用纯文本直接回复客户\n"
                 "2. 如果确实无法解决 → 调用 escalate_to_human 创建人工客服工单\n"
                 "注意：你不可以再调用任何业务工具，只能选择 1 或 2。\n"
@@ -366,32 +358,70 @@ def _build_domain_subgraph(
         }
 
     builder.add_node("llm", _llm_node)
-    builder.add_node("tools", ToolNode(tools + [escalate_to_human]))
+    # 转人工走独立的终止节点，避免并行调用创建多个工单。
+    builder.add_node("tools", ToolNode([
+        tool for tool in tools if tool.name != "escalate_to_human"
+    ]))
+    builder.add_node("finish", _finish_domain_tools)
 
     builder.add_edge(START, "llm")
     builder.add_conditional_edges(
         "llm",
         _should_continue_tools,
-        {"tools": "tools", "end": END},
+        {"tools": "tools", "finish": "finish", "end": END},
     )
     builder.add_edge("tools", "llm")
+    builder.add_edge("finish", END)
 
     return builder.compile()
 
 
 def _should_continue_tools(state: AgentState) -> str:
-    """条件边：判断是否继续工具调用循环。"""
+    """在图层限制业务调用，并将转人工路由到终止节点。"""
     messages = state["messages"]
     if not messages:
         return "end"
 
     last_msg = messages[-1]
 
-    # 有 tool_calls → 执行工具（llm_node 内部会在超限时强制终结）
-    if last_msg.tool_calls:
+    calls = getattr(last_msg, "tool_calls", [])
+    if calls:
+        if any(call["name"] == "escalate_to_human" for call in calls):
+            return "finish"
+        # 计数已在 LLM 节点中 +1；超限响应不能再执行业务工具。
+        if state.get("correction_attempts", 0) > MAX_CORRECTION_ATTEMPTS:
+            return "finish"
         return "tools"
 
     return "end"
+
+
+def _finish_domain_tools(state: AgentState) -> dict:
+    """至多执行一次转人工；为所有请求补齐 ToolMessage，然后直接结束。"""
+    calls = state["messages"][-1].tool_calls
+    results = []
+    handoff_attempted = False
+    final_answer = "自动处理已达到上限，请核对信息后重试，或联系人工客服。"
+
+    for call in calls:
+        if call["name"] == "escalate_to_human" and not handoff_attempted:
+            # 即使请求失败，也不在本轮重复创建，以免超时后产生重复工单。
+            handoff_attempted = True
+            try:
+                final_answer = str(escalate_to_human.invoke(call["args"]))
+            except Exception:
+                logger.exception("终止节点转人工失败")
+                final_answer = "转人工请求未能完成，请稍后重试或联系人工客服。"
+            content = final_answer
+        else:
+            content = "本次工具调用已取消：流程已进入终止阶段，不再执行额外操作。"
+        results.append(ToolMessage(
+            content=content,
+            name=call["name"],
+            tool_call_id=call["id"],
+        ))
+
+    return {"messages": [*results, AIMessage(content=final_answer)]}
 
 
 def _classify(user_text: str) -> CustomerIntent:
@@ -473,3 +503,4 @@ def _fallback_intent() -> dict:
         "route": "CHITCHAT",
         "correction_attempts": 0,
     }
+
